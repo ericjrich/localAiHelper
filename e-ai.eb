@@ -1,0 +1,1574 @@
+#!/usr/bin/env bash
+# e-ai.eb
+# Local offline-ish AI chatbot setup helper for Linux.
+# Installs/repairs Ollama + Open WebUI without Docker.
+# Creates a browser UI at http://localhost:8080 when running.
+
+set -Eeuo pipefail
+
+APP_NAME="e-ai"
+DEFAULT_MODEL="llama3.2:3b"
+VISION_MODEL="gemma3:4b"     # text + image (multimodal) option
+WEBUI_PORT="${WEBUI_PORT:-8080}"
+OLLAMA_URL="http://127.0.0.1:11434"
+BASE_DIR="${E_LOCAL_AI_DIR:-$HOME/.local/share/e-local-ai}"
+VENV_DIR="$BASE_DIR/open-webui-venv"
+LOG_DIR="$BASE_DIR/logs"
+BIN_DIR="$HOME/a-me/bin"
+RUNNER="$BIN_DIR/e-local-ai-run.eb"
+LOG_FILE="$LOG_DIR/e-local-ai.log"
+PERSONA_FILE="$BASE_DIR/persona-lodal.txt"   # shared with e-ailodal.eb / restore
+LODAL_NAME="lodal"                           # derived persona model name
+
+# Absolute path to this script, used to bundle a copy into offline archives.
+# Empty if the script was piped via stdin (e.g. curl | bash).
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+
+mkdir -p "$BASE_DIR" "$LOG_DIR"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+good() { printf '✅ %s\n' "$*"; }
+warn() { printf '⚠️  %s\n' "$*"; }
+bad()  { printf '❌ %s\n' "$*"; }
+info() { printf '• %s\n' "$*"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+pause() {
+  printf '\nPress Enter to continue...'
+  read -r _ || true
+}
+
+confirm() {
+  local prompt="${1:-Continue?}"
+  printf '%s [y/N]: ' "$prompt"
+  read -r ans || true
+  case "${ans,,}" in
+    y|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_cmd() {
+  printf '\n$ %s\n' "$*"
+  "$@"
+}
+
+# ----- checkbox helper ------------------------------------------------------
+# Fill globals CL_ITEMS=(...) and CL_STATE=(0/1 ...) before calling.
+# User toggles items by number; 'a' all, 'n' none, 'g' go, 'q' cancel.
+# Returns 0 with CL_STATE holding the final checked state; 1 on cancel.
+CL_ITEMS=()
+CL_STATE=()
+checklist_menu() {
+  local title="$1" c i mark
+  while true; do
+    clear || true
+    bold "$title"
+    echo
+    for i in "${!CL_ITEMS[@]}"; do
+      mark="[ ]"
+      [[ "${CL_STATE[$i]:-0}" == 1 ]] && mark="[x]"
+      printf '  %2d) %s %s\n' "$((i+1))" "$mark" "${CL_ITEMS[$i]}"
+    done
+    echo
+    echo "  number = toggle    a) all    n) none    g) go    q) cancel"
+    printf 'Choose: '
+    read -r c || return 1
+    case "${c,,}" in
+      g|go) return 0 ;;
+      a|all)  for i in "${!CL_ITEMS[@]}"; do CL_STATE[$i]=1; done ;;
+      n|none) for i in "${!CL_ITEMS[@]}"; do CL_STATE[$i]=0; done ;;
+      q|quit|cancel) return 1 ;;
+      "") ;;
+      *)
+        if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#CL_ITEMS[@]} )); then
+          i=$((c-1))
+          if [[ "${CL_STATE[$i]:-0}" == 1 ]]; then CL_STATE[$i]=0; else CL_STATE[$i]=1; fi
+        else
+          warn "Unknown choice."; pause
+        fi
+        ;;
+    esac
+  done
+}
+
+is_linux() {
+  [[ "$(uname -s)" == "Linux" ]]
+}
+
+pkg_manager() {
+  if have apt-get; then echo apt; return; fi
+  if have dnf; then echo dnf; return; fi
+  if have pacman; then echo pacman; return; fi
+  if have zypper; then echo zypper; return; fi
+  echo unknown
+}
+
+install_basic_packages() {
+  local pm
+  pm="$(pkg_manager)"
+
+  bold "Checking basic tools"
+
+  local missing=()
+
+  if ! have curl; then
+    missing+=("curl")
+  fi
+
+  # xdg-open is nice but not required. Package name is usually xdg-utils.
+  if ! have xdg-open; then
+    missing+=("xdg-utils")
+  fi
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    good "Basic tools look okay."
+    return 0
+  fi
+
+  warn "Some basic tools may be missing: ${missing[*]}"
+  info "I will also install ca-certificates when your package manager supports it."
+
+  if ! have sudo && [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    bad "sudo is not available. Install these yourself: ${missing[*]}"
+    return 1
+  fi
+
+  if ! confirm "Install missing basic packages with your package manager?"; then
+    warn "Skipping package install."
+    return 0
+  fi
+
+  case "$pm" in
+    apt)
+      run_cmd sudo apt-get update
+      run_cmd sudo apt-get install -y curl ca-certificates xdg-utils
+      ;;
+    dnf)
+      run_cmd sudo dnf install -y curl ca-certificates xdg-utils
+      ;;
+    pacman)
+      run_cmd sudo pacman -Sy --needed curl ca-certificates xdg-utils
+      ;;
+    zypper)
+      run_cmd sudo zypper install -y curl ca-certificates xdg-utils
+      ;;
+    *)
+      bad "Unknown package manager. Please install: curl ca-certificates xdg-utils"
+      return 1
+      ;;
+  esac
+}
+
+python_version_ok() {
+  local py="$1"
+  "$py" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info[:2] in [(3, 11), (3, 12)] else 1)
+PY
+}
+
+find_good_python() {
+  local candidates=(python3.12 python3.11 python3)
+  for py in "${candidates[@]}"; do
+    if have "$py" && python_version_ok "$py"; then
+      echo "$py"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_python_if_needed() {
+  if find_good_python >/dev/null 2>&1; then
+    good "Found compatible Python: $(find_good_python)"
+    return 0
+  fi
+
+  warn "Open WebUI currently wants Python 3.11 or 3.12. I did not find either."
+
+  if ! have sudo && [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    bad "sudo is not available. Install Python 3.11 or 3.12 plus venv support, then run this again."
+    return 1
+  fi
+
+  if ! confirm "Try installing Python 3.11/3.12 and venv support with your package manager?"; then
+    bad "Cannot continue Open WebUI setup without Python 3.11 or 3.12."
+    return 1
+  fi
+
+  case "$(pkg_manager)" in
+    apt)
+      run_cmd sudo apt-get update
+      # Try distro-provided packages without adding third-party repos.
+      run_cmd sudo apt-get install -y python3.12 python3.12-venv python3.12-dev python3-pip || \
+      run_cmd sudo apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip || true
+      ;;
+    dnf)
+      run_cmd sudo dnf install -y python3.12 python3.12-devel python3-pip || \
+      run_cmd sudo dnf install -y python3.11 python3.11-devel python3-pip || true
+      ;;
+    pacman)
+      run_cmd sudo pacman -Sy --needed python python-pip
+      ;;
+    zypper)
+      run_cmd sudo zypper install -y python312 python312-pip || \
+      run_cmd sudo zypper install -y python311 python311-pip || true
+      ;;
+    *)
+      bad "Unknown package manager. Install Python 3.11 or 3.12 manually."
+      return 1
+      ;;
+  esac
+
+  if find_good_python >/dev/null 2>&1; then
+    good "Compatible Python is ready: $(find_good_python)"
+  else
+    bad "Still could not find Python 3.11 or 3.12."
+    info "On Ubuntu 22.04, you may need a Python 3.11/3.12 package source first. I did not add one automatically."
+    return 1
+  fi
+}
+
+install_ollama() {
+  bold "Installing/repairing Ollama"
+  install_basic_packages
+
+  if have ollama; then
+    good "Ollama command already exists: $(command -v ollama)"
+  else
+    warn "This will run Ollama's official Linux install script."
+    if ! confirm "Install Ollama now?"; then
+      warn "Skipping Ollama install."
+      return 1
+    fi
+    curl -fsSL https://ollama.com/install.sh | sh
+  fi
+
+  start_ollama
+
+  if curl -fsS "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    good "Ollama is responding at $OLLAMA_URL"
+  else
+    bad "Ollama command exists, but the local server is not responding."
+    info "Try: ollama serve"
+    return 1
+  fi
+}
+
+start_ollama() {
+  if curl -fsS "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if have systemctl && systemctl list-unit-files 2>/dev/null | grep -q '^ollama\.service'; then
+    info "Starting Ollama system service..."
+    sudo systemctl enable --now ollama >/dev/null 2>&1 || true
+    sleep 2
+  fi
+
+  if curl -fsS "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if have ollama; then
+    info "Starting Ollama in the background..."
+    nohup ollama serve > "$LOG_DIR/ollama.log" 2>&1 &
+    sleep 3
+  fi
+}
+
+pull_model() {
+  local model="${1:-$DEFAULT_MODEL}"
+  bold "Pulling local model: $model"
+
+  if ! have ollama; then
+    install_ollama
+  fi
+
+  start_ollama
+
+  if ! curl -fsS "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    bad "Ollama is not responding, so I cannot pull a model."
+    return 1
+  fi
+
+  run_cmd ollama pull "$model"
+  good "Model is ready: $model"
+}
+
+install_open_webui() {
+  bold "Installing/repairing Open WebUI without Docker"
+  install_basic_packages
+  install_python_if_needed
+
+  local py
+  py="$(find_good_python)"
+
+  mkdir -p "$BASE_DIR"
+
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    info "Creating virtual environment at $VENV_DIR"
+    run_cmd "$py" -m venv "$VENV_DIR"
+  else
+    good "Virtual environment already exists: $VENV_DIR"
+  fi
+
+  info "Upgrading pip inside the virtual environment..."
+  run_cmd "$VENV_DIR/bin/python" -m pip install --upgrade pip wheel setuptools
+
+  info "Installing/upgrading Open WebUI. This can take a while and may download a lot."
+  run_cmd "$VENV_DIR/bin/python" -m pip install --upgrade open-webui
+
+  good "Open WebUI is installed."
+}
+
+create_runner() {
+  bold "Creating launcher"
+  mkdir -p "$BIN_DIR"
+
+  # Extra environment baked into the launcher. These are harmless online and
+  # make a restored offline install self-contained.
+  local extra_env=""
+  extra_env+=$'export PATH="'"$BIN_DIR"$':$PATH"\n'
+  if [[ -d "$HOME/.ollama/models" ]]; then
+    extra_env+=$'export OLLAMA_MODELS="'"$HOME/.ollama/models"$'"\n'
+  fi
+  if [[ -d "$BASE_DIR/ollama-lib" ]]; then
+    extra_env+=$'export OLLAMA_LIBRARY_PATH="'"$BASE_DIR/ollama-lib"$'"\n'
+    extra_env+=$'export LD_LIBRARY_PATH="'"$BASE_DIR/ollama-lib"$':${LD_LIBRARY_PATH:-}"\n'
+  fi
+
+  cat > "$RUNNER" <<RUNNER_EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+${extra_env}BASE_DIR="\${E_LOCAL_AI_DIR:-\$HOME/.local/share/e-local-ai}"
+VENV_DIR="\$BASE_DIR/open-webui-venv"
+LOG_DIR="\$BASE_DIR/logs"
+WEBUI_PORT="\${WEBUI_PORT:-$WEBUI_PORT}"
+OLLAMA_URL="http://127.0.0.1:11434"
+mkdir -p "\$LOG_DIR"
+
+have() { command -v "\$1" >/dev/null 2>&1; }
+
+if ! have ollama; then
+  echo "Ollama is not installed. Run e-ai.eb again and choose install."
+  exit 1
+fi
+
+if ! curl -fsS "\$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+  if have systemctl && systemctl list-unit-files 2>/dev/null | grep -q '^ollama\\.service'; then
+    sudo systemctl enable --now ollama >/dev/null 2>&1 || true
+    sleep 2
+  fi
+fi
+
+if ! curl -fsS "\$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+  nohup ollama serve > "\$LOG_DIR/ollama.log" 2>&1 &
+  sleep 3
+fi
+
+if [[ ! -x "\$VENV_DIR/bin/open-webui" ]]; then
+  echo "Open WebUI is not installed. Run e-ai.eb again and choose install."
+  exit 1
+fi
+
+echo "Starting Open WebUI..."
+echo "Open this in your browser: http://localhost:\$WEBUI_PORT"
+echo "Press Ctrl+C here to stop the web UI."
+
+if have xdg-open; then
+  (sleep 3; xdg-open "http://localhost:\$WEBUI_PORT" >/dev/null 2>&1 || true) &
+fi
+
+PORT="\$WEBUI_PORT" "\$VENV_DIR/bin/open-webui" serve
+RUNNER_EOF
+
+  chmod +x "$RUNNER"
+  good "Launcher created: $RUNNER"
+}
+
+start_webui() {
+  bold "Starting local AI web UI"
+
+  if ! have ollama; then
+    warn "Ollama is not installed yet."
+    install_ollama
+  fi
+
+  if [[ ! -x "$VENV_DIR/bin/open-webui" ]]; then
+    warn "Open WebUI is not installed yet."
+    install_open_webui
+  fi
+
+  create_runner
+  exec "$RUNNER"
+}
+
+status_report() {
+  bold "Local AI status"
+
+  if have ollama; then
+    good "Ollama command: $(command -v ollama)"
+  else
+    bad "Ollama command not found."
+  fi
+
+  if curl -fsS "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    good "Ollama server is running at $OLLAMA_URL"
+    echo
+    info "Installed Ollama models:"
+    ollama list || true
+  else
+    warn "Ollama server is not responding at $OLLAMA_URL"
+  fi
+
+  if [[ -x "$VENV_DIR/bin/open-webui" ]]; then
+    good "Open WebUI exists in: $VENV_DIR"
+  else
+    warn "Open WebUI is not installed in: $VENV_DIR"
+  fi
+
+  if [[ -x "$RUNNER" ]]; then
+    good "Launcher exists: $RUNNER"
+  else
+    warn "Launcher not created yet."
+  fi
+
+  echo
+  info "Web UI address when running: http://localhost:$WEBUI_PORT"
+}
+
+do_everything() {
+  bold "Full setup: Ollama + model + Open WebUI + launcher"
+  install_ollama
+  pull_model "$DEFAULT_MODEL"
+  install_open_webui
+  create_runner
+
+  echo
+  good "Setup complete."
+  echo
+  bold "Start it with:"
+  echo "  $RUNNER"
+  echo
+  bold "Then open:"
+  echo "  http://localhost:$WEBUI_PORT"
+}
+
+# ----- Offline archive: create / restore ------------------------------------
+#
+# Goal: produce one portable bundle that stands up the whole stack on a
+# completely offline Linux Mint machine, then hands the user a ready-to-paste
+# Lodal persona prompt. Contents:
+#
+#   e-ai-offline/
+#     meta/manifest.txt            versions, arch, source paths
+#     meta/python-version.txt      python minor used to build the wheelhouse
+#     meta/frozen-requirements.txt exact pip freeze of the working venv
+#     ollama/bin/ollama            the Ollama engine binary
+#     ollama/lib/                  optional Ollama support libraries
+#     ollama/models/               pulled models (blobs + manifests)
+#     wheelhouse/                  wheels for Open WebUI + virtualenv (offline pip)
+#     persona-lodal.txt            ready-to-paste Lodal system prompt
+#     RESTORE-README.txt
+#
+# We deliberately do NOT bundle Open WebUI's database/accounts/chats. That
+# migration is fragile; instead the restored Open WebUI is treated as fresh and
+# the Lodal personality is recreated by pasting persona-lodal.txt.
+#
+# The only hard requirement on the offline machine is a base Python 3.11/3.12.
+# We bundle the "virtualenv" tool so a venv can be built even when the distro's
+# python3-venv package is not installed and there is no internet.
+#
+# Preferred format is tar.zst (Linux-native, fast, good on small/text files);
+# falls back to .zip when zstd is not available. The restore step auto-detects
+# the format from the file extension.
+
+ARCHIVE_PREFIX="e-ai-offline"   # top-level folder name inside the archive
+
+# zip <parent> <name> <out.zip>: zip <parent>/<name> using python stdlib (no zip pkg needed)
+zip_dir() {
+  local parent="$1" name="$2" out="$3"
+  if have python3; then
+    ( cd "$parent" && python3 -m zipfile -c "$out" "$name" )
+  elif have zip; then
+    ( cd "$parent" && zip -r -q "$out" "$name" )
+  else
+    bad "Need python3 (or zip) to create the archive."
+    return 1
+  fi
+}
+
+# unzip_to <archive.zip> <destdir>
+unzip_to() {
+  local zipf="$1" dest="$2"
+  mkdir -p "$dest"
+  if have python3; then
+    python3 -m zipfile -e "$zipf" "$dest"
+  elif have unzip; then
+    unzip -q -o "$zipf" -d "$dest"
+  else
+    bad "Need python3 (or unzip) to read the archive."
+    return 1
+  fi
+}
+
+# True when we can build/read tar.zst archives.
+have_zstd() { have zstd && have tar; }
+
+# Preferred default filename for a new archive, based on what's installed.
+default_archive_name() {
+  if have_zstd; then echo "e-ai-offline-bundle.tar.zst"; else echo "e-ai.zip"; fi
+}
+
+# Normalize a chosen output path: append the preferred extension if none is
+# given, and downgrade tar.zst -> zip if zstd is missing. Echoes final path.
+normalize_archive_path() {
+  local out="$1"
+  case "$out" in
+    *.tar.zst|*.tzst)
+      if ! have_zstd; then
+        warn "zstd not available; saving as .zip instead." >&2
+        out="${out%.tar.zst}"; out="${out%.tzst}"; out="$out.zip"
+      fi
+      ;;
+    *.zip) : ;;
+    *)
+      if have_zstd; then out="$out.tar.zst"; else out="$out.zip"; fi
+      ;;
+  esac
+  printf '%s\n' "$out"
+}
+
+# pack_archive <parent> <name> <out>: dispatch on extension.
+pack_archive() {
+  local parent="$1" name="$2" out="$3"
+  case "$out" in
+    *.tar.zst|*.tzst)
+      info "Packing with tar + zstd..."
+      ( cd "$parent" && tar -cf - "$name" ) | zstd -T0 -q -f -o "$out"
+      ;;
+    *.zip)
+      info "Packing with zip..."
+      zip_dir "$parent" "$name" "$out"
+      ;;
+    *)
+      bad "Unknown archive extension: $out"
+      return 1
+      ;;
+  esac
+}
+
+# extract_archive <archive> <destdir>: auto-detect format by extension, with a
+# magic-byte sniff fallback for oddly named files.
+extract_archive() {
+  local arch="$1" dest="$2"
+  mkdir -p "$dest"
+  case "$arch" in
+    *.tar.zst|*.tzst)
+      if ! have zstd; then
+        bad "This archive needs zstd to extract, but zstd is not installed."
+        info "Install zstd on this machine, or rebuild the archive as .zip."
+        return 1
+      fi
+      zstd -dc "$arch" | tar -C "$dest" -xf -
+      ;;
+    *.zip)
+      unzip_to "$arch" "$dest"
+      ;;
+    *)
+      if have zstd && zstd -t "$arch" >/dev/null 2>&1; then
+        zstd -dc "$arch" | tar -C "$dest" -xf -
+      else
+        unzip_to "$arch" "$dest"
+      fi
+      ;;
+  esac
+}
+
+# Write the Lodal persona system prompt to <path>.
+write_persona_file() {
+  local f="$1"
+  cat > "$f" <<'PERSONA'
+You are Lodal, a foul-mouthed local AI chatbot with a rough, sarcastic, funny
+personality. You talk like a cranky robot goblin who secretly gives a damn. You
+swear casually, roast the user playfully, and use dark humor when appropriate,
+but underneath the attitude you are helpful, loyal, and practical.
+
+You should sound like a weirdly educated dirtbag friend: funny, direct,
+technically competent, and emotionally supportive without being mushy. You can
+joke in a sinister or dramatic way, but do not actually encourage harm.
+
+Style rules:
+* Be casual and conversational.
+* Use profanity naturally, but do not make every sentence a swear bomb.
+* Prefer practical answers over corporate-sounding explanations.
+* When helping with Linux, Bash, coding, local AI, electronics, or
+  troubleshooting, give clear commands and explain what they do.
+* If something is risky, destructive, or likely to break the user's machine,
+  say so bluntly.
+* Keep the tough-guy act, but actually help.
+
+Identity:
+You are Lodal. You are a local AI gremlin living in the user's machine.
+PERSONA
+}
+
+# Write the offline bootstrap installer to <path>. Lets a machine WITHOUT
+# e-ai.eb install the whole stack straight from the extracted archive folder.
+write_install_sh() {
+  local f="$1"
+  cat > "$f" <<'BOOT'
+#!/usr/bin/env bash
+# install.sh - offline bootstrap for the e-ai stack.
+#
+# Use this on an offline machine that does NOT already have e-ai.eb:
+#   1) Extract this archive (see RESTORE-README.txt).
+#   2) cd into the extracted folder.
+#   3) Run:  ./install.sh
+#
+# It installs Ollama, the models, Open WebUI (from the bundled wheelhouse),
+# the Lodal persona prompt, a launcher, and leaves e-ai.eb in ~/a-me/bin.
+set -Eeuo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! -f "$HERE/e-ai.eb" ]]; then
+  echo "ERROR: e-ai.eb was not found next to install.sh." >&2
+  echo "The archive may be incomplete; rebuild it with a newer e-ai.eb." >&2
+  exit 1
+fi
+
+chmod +x "$HERE/e-ai.eb" 2>/dev/null || true
+exec bash "$HERE/e-ai.eb" restore-dir "$HERE"
+BOOT
+  chmod +x "$f" 2>/dev/null || true
+}
+
+# Pick a save path with zenity; fall back to a text prompt. Path echoed on stdout.
+ask_save_path() {
+  local default out=""
+  default="$HOME/$(default_archive_name)"
+  if have zenity && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    out="$(zenity --file-selection --save --confirm-overwrite \
+            --filename="$default" \
+            --title="Save Offline AI Archive As" 2>/dev/null)" || return 1
+  else
+    warn "Graphical file chooser not available; using a text prompt." >&2
+    printf 'Save archive as [%s]: ' "$default" >&2
+    read -r out || return 1
+    out="${out:-$default}"
+  fi
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# Pick an existing archive with zenity; fall back to a text prompt. Path echoed on stdout.
+ask_open_zip() {
+  local out=""
+  if have zenity && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    out="$(zenity --file-selection \
+            --title="Choose e-ai offline archive (.tar.zst or .zip)" \
+            --file-filter='AI archives | *.tar.zst *.tzst *.zip' \
+            --file-filter='All files | *' 2>/dev/null)" || return 1
+  else
+    warn "Graphical file chooser not available; using a text prompt." >&2
+    printf 'Path to e-ai archive (.tar.zst or .zip): ' >&2
+    read -r out || return 1
+  fi
+  [[ -n "$out" && -f "$out" ]] || { bad "No valid file chosen." >&2; return 1; }
+  printf '%s\n' "$out"
+}
+
+detect_ollama_bin() {
+  local b
+  b="$(command -v ollama 2>/dev/null || true)"
+  [[ -n "$b" ]] && { printf '%s\n' "$b"; return 0; }
+  for b in /usr/local/bin/ollama /usr/bin/ollama; do
+    [[ -x "$b" ]] && { printf '%s\n' "$b"; return 0; }
+  done
+  return 1
+}
+
+detect_ollama_libdir() {
+  local d
+  for d in /usr/local/lib/ollama /usr/lib/ollama; do
+    [[ -d "$d" ]] && { printf '%s\n' "$d"; return 0; }
+  done
+  return 1
+}
+
+detect_models_dir() {
+  local d
+  for d in "${OLLAMA_MODELS:-}" "$HOME/.ollama/models" /usr/share/ollama/.ollama/models; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    if [[ -d "$d/manifests" || -d "$d/blobs" ]]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  return 1
+}
+
+# Find a base interpreter for restore. If a specific minor is wanted, match it exactly.
+find_base_python() {
+  local want="${1:-}" cands=() py
+  case "$want" in
+    3.11) cands=(python3.11 python3) ;;
+    3.12) cands=(python3.12 python3) ;;
+    *)    cands=(python3.12 python3.11 python3) ;;
+  esac
+  for py in "${cands[@]}"; do
+    have "$py" || continue
+    if [[ -n "$want" && "$want" != unknown ]]; then
+      if "$py" -c "import sys;raise SystemExit(0 if '%d.%d'%sys.version_info[:2]=='$want' else 1)" 2>/dev/null; then
+        printf '%s\n' "$py"; return 0
+      fi
+    elif python_version_ok "$py"; then
+      printf '%s\n' "$py"; return 0
+    fi
+  done
+  return 1
+}
+
+write_manifest() {
+  local f="$1" obin="${2:-}" mdir="${3:-}" owui_ver="unknown" oll_ver="unknown"
+  if [[ -x "$VENV_DIR/bin/python" ]]; then
+    owui_ver="$("$VENV_DIR/bin/python" -m pip show open-webui 2>/dev/null | awk -F': ' '/^Version:/{print $2}')"
+    [[ -n "$owui_ver" ]] || owui_ver="unknown"
+  fi
+  if [[ -n "$obin" ]]; then
+    oll_ver="$("$obin" --version 2>/dev/null | head -n1 || true)"
+    [[ -n "$oll_ver" ]] || oll_ver="unknown"
+  fi
+  {
+    echo "app=$APP_NAME"
+    echo "created=$(date -Is 2>/dev/null || date)"
+    echo "host=$(uname -a)"
+    echo "arch=$(uname -m)"
+    echo "ollama_bin_src=${obin:-none}"
+    echo "ollama_version=$oll_ver"
+    echo "models_src=${mdir:-none}"
+    echo "open_webui_version=$owui_ver"
+    echo "default_model=$DEFAULT_MODEL"
+    echo "webui_port=$WEBUI_PORT"
+  } > "$f"
+}
+
+# Writes a small Python helper to /tmp for listing models in an Ollama models
+# dir and copying only selected ones (manifest + the blobs it references).
+write_models_helper() {
+  cat > /tmp/e-ai-models.py <<'PY'
+import sys, os, json, shutil
+
+def manifests_root(m): return os.path.join(m, "manifests")
+def blobs_root(m): return os.path.join(m, "blobs")
+
+def iter_manifests(mdir):
+    root = manifests_root(mdir)
+    if not os.path.isdir(root):
+        return
+    for dp, _, files in os.walk(root):
+        for fn in files:
+            full = os.path.join(dp, fn)
+            rel = os.path.relpath(full, root)            # registry/ns/name/tag
+            parts = rel.split(os.sep)
+            tag  = parts[-1]
+            name = parts[-2] if len(parts) >= 2 else tag
+            ns   = parts[-3] if len(parts) >= 3 else "library"
+            disp = f"{name}:{tag}" if ns == "library" else f"{ns}/{name}:{tag}"
+            yield disp, full, rel
+
+def to_blob(d):
+    return "sha256-" + d.split(":", 1)[1] if ":" in d else d
+
+def cmd_list(mdir):
+    seen = set()
+    for disp, _, _ in iter_manifests(mdir):
+        if disp not in seen:
+            seen.add(disp); print(disp)
+
+def cmd_copy(mdir, dest, names):
+    want = set(names)
+    broot = blobs_root(mdir)
+    dman, dblob = manifests_root(dest), blobs_root(dest)
+    os.makedirs(dman, exist_ok=True); os.makedirs(dblob, exist_ok=True)
+    done = set(); n_man = 0
+    for disp, full, rel in iter_manifests(mdir):
+        if disp not in want:
+            continue
+        dst = os.path.join(dman, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(full, dst); n_man += 1
+        try:
+            man = json.load(open(full))
+        except Exception as e:
+            print(f"WARN: bad manifest {full}: {e}", file=sys.stderr); continue
+        digs = []
+        c = man.get("config")
+        if isinstance(c, dict) and c.get("digest"):
+            digs.append(c["digest"])
+        for layer in man.get("layers", []):
+            if layer.get("digest"):
+                digs.append(layer["digest"])
+        for d in digs:
+            bn = to_blob(d)
+            if bn in done:
+                continue
+            src = os.path.join(broot, bn)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(dblob, bn)); done.add(bn)
+            else:
+                print(f"WARN: missing blob {bn} for {disp}", file=sys.stderr)
+    print(f"OK {n_man} manifest(s), {len(done)} blob(s)")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        sys.exit("usage: e-ai-models.py list|copy <models_dir> [dest] [names...]")
+    cmd = sys.argv[1]
+    if cmd == "list":
+        cmd_list(sys.argv[2])
+    elif cmd == "copy":
+        if len(sys.argv) < 4:
+            sys.exit("copy needs <dest> and at least one model name")
+        cmd_copy(sys.argv[2], sys.argv[3], sys.argv[4:])
+    else:
+        sys.exit("unknown cmd")
+PY
+}
+
+create_offline_archive() {
+  bold "Create Offline AI Install Archive"
+
+  if ! have_zstd && ! have python3 && ! have zip; then
+    bad "Need zstd+tar (preferred) or python3/zip to build the archive."
+    return 1
+  fi
+
+  local out_archive
+  out_archive="$(ask_save_path)" || { warn "Cancelled."; return 1; }
+  [[ "$out_archive" == /* ]] || out_archive="$PWD/$out_archive"
+  out_archive="$(normalize_archive_path "$out_archive")"
+  info "Archive will be saved to: $out_archive"
+
+  local stage_parent stage
+  stage_parent="$(mktemp -d /tmp/e-ai-archive.XXXXXX)"
+  stage="$stage_parent/$ARCHIVE_PREFIX"
+  mkdir -p "$stage"/{meta,ollama/bin,ollama/models,wheelhouse}
+
+  # 1) Ollama binary + optional libs
+  local obin olib
+  if obin="$(detect_ollama_bin)"; then
+    info "Copying Ollama binary: $obin"
+    cp -f "$obin" "$stage/ollama/bin/ollama"
+    chmod +x "$stage/ollama/bin/ollama"
+  else
+    warn "Ollama binary not found. Install/run Ollama first for a complete archive."
+    obin=""
+  fi
+
+  if olib="$(detect_ollama_libdir)"; then
+    info "Copying Ollama support libraries: $olib"
+    mkdir -p "$stage/ollama/lib"
+    cp -a "$olib/." "$stage/ollama/lib/" 2>/dev/null || warn "Some Ollama libs were skipped."
+  fi
+
+  # 2) Models (choose which to include)
+  local mdir
+  if mdir="$(detect_models_dir)"; then
+    write_models_helper
+    local _models=()
+    mapfile -t _models < <(python3 /tmp/e-ai-models.py list "$mdir" 2>/dev/null || true)
+    if [[ ${#_models[@]} -eq 0 ]]; then
+      warn "No models found in $mdir; the archive will contain no models."
+    else
+      local _i sel=()
+      CL_ITEMS=( "${_models[@]}" )
+      CL_STATE=()
+      for _i in "${!_models[@]}"; do CL_STATE[$_i]=1; done   # default: include all
+      if checklist_menu "Which models to include in the archive?"; then
+        for _i in "${!_models[@]}"; do
+          [[ "${CL_STATE[$_i]:-0}" == 1 ]] && sel+=("${_models[$_i]}")
+        done
+        if [[ ${#sel[@]} -eq 0 ]]; then
+          warn "No models selected; the archive will contain no models."
+        else
+          info "Including ${#sel[@]} model(s): ${sel[*]}"
+          if ! python3 /tmp/e-ai-models.py copy "$mdir" "$stage/ollama/models" "${sel[@]}"; then
+            warn "Model copy hit a permission issue; retrying with sudo for reads."
+            sudo python3 /tmp/e-ai-models.py copy "$mdir" "$stage/ollama/models" "${sel[@]}" \
+              || warn "Some models may be incomplete."
+            sudo chown -R "$(id -u):$(id -g)" "$stage/ollama/models" 2>/dev/null || true
+          fi
+        fi
+      else
+        warn "Model selection cancelled; the archive will contain no models."
+      fi
+    fi
+  else
+    warn "No Ollama models found. Pull a model first (e.g. $DEFAULT_MODEL)."
+    mdir=""
+  fi
+
+  # 3) Python wheelhouse for Open WebUI (+ virtualenv for offline venv creation)
+  local py pyver
+  if [[ -x "$VENV_DIR/bin/python" ]]; then
+    py="$VENV_DIR/bin/python"
+  else
+    py="$(find_good_python || true)"
+  fi
+
+  if [[ -n "${py:-}" ]]; then
+    pyver="$("$py" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+    printf '%s\n' "$pyver" > "$stage/meta/python-version.txt"
+    info "Building offline wheelhouse with Python $pyver (downloads from the internet now)."
+
+    if [[ -x "$VENV_DIR/bin/python" ]]; then
+      "$VENV_DIR/bin/python" -m pip freeze > "$stage/meta/frozen-requirements.txt" 2>/dev/null || true
+    fi
+
+    # Always include the bootstrap tools so the offline machine can build a venv.
+    "$py" -m pip download --prefer-binary --dest "$stage/wheelhouse" \
+        pip setuptools wheel virtualenv \
+      || warn "Some bootstrap packages may not have downloaded cleanly."
+
+    if [[ -s "$stage/meta/frozen-requirements.txt" ]]; then
+      info "Downloading exact pinned set from the working venv..."
+      "$py" -m pip download --prefer-binary --dest "$stage/wheelhouse" \
+          -r "$stage/meta/frozen-requirements.txt" \
+        || warn "Some pinned packages may not have downloaded cleanly."
+    else
+      info "No working venv freeze found; downloading latest open-webui."
+      "$py" -m pip download --prefer-binary --dest "$stage/wheelhouse" open-webui \
+        || warn "Some open-webui packages may not have downloaded cleanly."
+    fi
+  else
+    warn "No compatible Python found; wheelhouse will be empty (Open WebUI won't restore offline)."
+    printf 'unknown\n' > "$stage/meta/python-version.txt"
+  fi
+
+  # 4) Lodal persona prompt (top level, for manual paste into Open WebUI)
+  info "Adding Lodal persona prompt (persona-lodal.txt)."
+  write_persona_file "$stage/persona-lodal.txt"
+
+  # 5) Self-contained installer: bundle a copy of this script + a bootstrap
+  #    so a machine WITHOUT e-ai.eb can install straight from the archive.
+  if [[ -n "${SCRIPT_PATH:-}" && -f "$SCRIPT_PATH" ]]; then
+    info "Bundling e-ai.eb and install.sh into the archive."
+    cp -f "$SCRIPT_PATH" "$stage/e-ai.eb"
+    chmod +x "$stage/e-ai.eb" 2>/dev/null || true
+    write_install_sh "$stage/install.sh"
+  else
+    warn "Could not locate this script on disk; install.sh bootstrap will be omitted."
+    warn "(Restore will still work on machines that already have e-ai.eb.)"
+  fi
+
+  # 6) Manifest + readme
+  write_manifest "$stage/meta/manifest.txt" "$obin" "$mdir"
+  cat > "$stage/RESTORE-README.txt" <<'TXT'
+e-ai offline install archive
+============================
+Restore on an offline Linux Mint machine that has:
+  - the same CPU architecture (x86_64), and
+  - a base Python matching meta/python-version.txt (Mint 22 ships Python 3.12).
+  - zstd installed, IF this archive is a .tar.zst (a .zip needs nothing extra).
+
+------------------------------------------------------------------------------
+HOW TO INSTALL
+------------------------------------------------------------------------------
+
+A) If you ALREADY have e-ai.eb on the machine:
+   Run it and choose "Restore/install from an e-ai archive" (menu option 9),
+   or:  ./e-ai.eb restore
+
+B) If you DO NOT have e-ai.eb (fresh offline machine):
+   1) Extract this archive:
+        .zip       ->  unzip e-ai.zip          (or: python3 -m zipfile -e e-ai.zip .)
+        .tar.zst   ->  tar -xf e-ai-offline-bundle.tar.zst
+                       (needs zstd; or: zstd -dc bundle.tar.zst | tar -x)
+   2) cd e-ai-offline
+   3) bash install.sh      (or: chmod +x install.sh && ./install.sh)
+
+------------------------------------------------------------------------------
+
+What the install DOES:
+  - Ollama models are restored automatically.
+  - Open WebUI is restored/reinstalled from the bundled offline wheelhouse.
+  - A launcher is created so you can start the whole stack.
+  - e-ai.eb is installed into ~/a-me/bin so you keep the tool.
+  - persona-lodal.txt is copied to ~/.local/share/e-local-ai/ for you to paste.
+
+What the install does NOT do:
+  - Open WebUI user accounts, chats, and saved personas are NOT guaranteed to
+    transfer. Treat the restored Open WebUI as a fresh install.
+  - To recreate "Lodal", open persona-lodal.txt and paste it into
+    Open WebUI -> Workspace -> Models -> System Prompt.
+
+Layout:
+  install.sh              offline bootstrap installer (run this if no e-ai.eb)
+  e-ai.eb                 a copy of the setup tool
+  ollama/bin/ollama       Ollama engine binary
+  ollama/lib/             optional Ollama support libraries
+  ollama/models/          pulled models (blobs + manifests)
+  wheelhouse/             Python wheels for Open WebUI + virtualenv (offline pip)
+  persona-lodal.txt       ready-to-paste Lodal system prompt
+  meta/                   versions and manifest
+TXT
+
+  # 7) Package
+  bold "Packaging archive..."
+  rm -f "$out_archive"
+  if pack_archive "$stage_parent" "$ARCHIVE_PREFIX" "$out_archive"; then
+    good "Archive created: $out_archive"
+    info "Size: $(du -h "$out_archive" 2>/dev/null | awk '{print $1}')"
+  else
+    bad "Failed to create archive."
+    rm -rf "$stage_parent"
+    return 1
+  fi
+
+  rm -rf "$stage_parent"
+}
+
+restore_python_venv() {
+  local src="$1" wheel="$src/wheelhouse"
+
+  if [[ ! -d "$wheel" || -z "$(ls -A "$wheel" 2>/dev/null)" ]]; then
+    warn "No wheelhouse in archive; cannot build Open WebUI venv offline."
+    return 1
+  fi
+
+  local want_pyver py
+  want_pyver="$(cat "$src/meta/python-version.txt" 2>/dev/null || echo unknown)"
+
+  if ! py="$(find_base_python "$want_pyver")"; then
+    bad "No compatible base Python found (need ${want_pyver:-3.11/3.12})."
+    info "Install Python ${want_pyver} on this machine, then restore again."
+    return 1
+  fi
+  info "Using base Python: $py ($("$py" -V 2>&1))"
+
+  mkdir -p "$BASE_DIR"
+  rm -rf "$VENV_DIR"
+
+  # Build the venv from the bundled virtualenv wheel (works without python3-venv,
+  # and without internet). virtualenv seeds its own pip/setuptools/wheel.
+  local vrt_whl deps
+  vrt_whl="$(ls "$wheel"/virtualenv-*.whl 2>/dev/null | head -n1 || true)"
+  if [[ -n "$vrt_whl" ]]; then
+    deps="$(ls "$wheel"/distlib-*.whl "$wheel"/filelock-*.whl "$wheel"/platformdirs-*.whl 2>/dev/null | tr '\n' ':')"
+    info "Creating virtual environment with bundled virtualenv..."
+    if PYTHONPATH="$vrt_whl:$deps" "$py" -m virtualenv --no-download "$VENV_DIR" >/dev/null 2>&1; then
+      good "Virtual environment created."
+    else
+      warn "virtualenv path failed; trying stdlib venv."
+      "$py" -m venv "$VENV_DIR" || { bad "Could not create venv."; return 1; }
+    fi
+  else
+    info "virtualenv wheel not bundled; trying stdlib venv."
+    "$py" -m venv "$VENV_DIR" || { bad "Could not create venv (python3-venv may be missing)."; return 1; }
+  fi
+
+  info "Installing Open WebUI from wheelhouse (offline)..."
+  local reqs="$src/meta/frozen-requirements.txt"
+  if [[ -s "$reqs" ]]; then
+    "$VENV_DIR/bin/python" -m pip install --no-index --find-links "$wheel" -r "$reqs" \
+      || "$VENV_DIR/bin/python" -m pip install --no-index --find-links "$wheel" open-webui \
+      || { bad "Offline pip install failed."; return 1; }
+  else
+    "$VENV_DIR/bin/python" -m pip install --no-index --find-links "$wheel" open-webui \
+      || { bad "Offline pip install failed."; return 1; }
+  fi
+
+  if [[ -x "$VENV_DIR/bin/open-webui" ]]; then
+    good "Open WebUI installed offline."
+  else
+    warn "open-webui launcher not found after install."
+  fi
+}
+
+# Install the whole stack from an ALREADY-EXTRACTED archive directory <src>.
+# <src> is the folder that directly contains meta/, ollama/, wheelhouse/, etc.
+# Used both by the in-script restore and by the bundled install.sh bootstrap.
+install_from_dir() {
+  local src="$1"
+
+  if [[ ! -d "$src/meta" && ! -d "$src/ollama" ]]; then
+    bad "This does not look like an e-ai archive folder: $src"
+    return 1
+  fi
+
+  if [[ -f "$src/meta/manifest.txt" ]]; then
+    echo; bold "Archive info:"; cat "$src/meta/manifest.txt"; echo
+  fi
+
+  # Architecture sanity check
+  local want_arch this_arch
+  want_arch="$(awk -F= '/^arch=/{print $2}' "$src/meta/manifest.txt" 2>/dev/null || true)"
+  this_arch="$(uname -m)"
+  if [[ -n "$want_arch" && "$want_arch" != "$this_arch" ]]; then
+    warn "Archive arch ($want_arch) != this machine ($this_arch). Binaries/wheels may not work."
+    confirm "Continue anyway?" || return 1
+  fi
+
+  mkdir -p "$BASE_DIR" "$LOG_DIR" "$BIN_DIR"
+
+  # 1) Ollama binary -> user bin (no sudo needed)
+  if [[ -f "$src/ollama/bin/ollama" ]]; then
+    info "Installing Ollama binary to $BIN_DIR/ollama"
+    cp -f "$src/ollama/bin/ollama" "$BIN_DIR/ollama"
+    chmod +x "$BIN_DIR/ollama"
+  else
+    warn "No Ollama binary in archive."
+  fi
+
+  if [[ -d "$src/ollama/lib" ]]; then
+    info "Installing Ollama support libraries to $BASE_DIR/ollama-lib"
+    mkdir -p "$BASE_DIR/ollama-lib"
+    cp -a "$src/ollama/lib/." "$BASE_DIR/ollama-lib/" 2>/dev/null || true
+  fi
+
+  # 2) Models -> user models dir (matches `ollama serve` run as the user)
+  if [[ -d "$src/ollama/models" ]]; then
+    info "Installing models to $HOME/.ollama/models (can be large)..."
+    mkdir -p "$HOME/.ollama/models"
+    cp -a "$src/ollama/models/." "$HOME/.ollama/models/" 2>/dev/null || true
+  else
+    warn "No models in archive."
+  fi
+
+  # 3) Python venv + Open WebUI (offline)
+  restore_python_venv "$src" || warn "Open WebUI venv restore had problems."
+
+  # 4) Lodal persona prompt -> data dir, for manual paste into Open WebUI
+  local persona_dest="$BASE_DIR/persona-lodal.txt"
+  if [[ -f "$src/persona-lodal.txt" ]]; then
+    cp -f "$src/persona-lodal.txt" "$persona_dest"
+  fi
+
+  # 5) Keep the tool: install the bundled e-ai.eb into the user's bin
+  if [[ -f "$src/e-ai.eb" ]]; then
+    info "Installing e-ai.eb to $BIN_DIR/e-ai.eb"
+    cp -f "$src/e-ai.eb" "$BIN_DIR/e-ai.eb"
+    chmod +x "$BIN_DIR/e-ai.eb"
+  fi
+
+  # 6) Launcher
+  create_runner
+
+  echo
+  good "Install complete."
+  if [[ -f "$persona_dest" ]]; then
+    echo
+    good "Lodal persona prompt installed at $persona_dest."
+    info "Open it and paste it into Open WebUI → Workspace → Models → System Prompt."
+  fi
+  echo
+  bold "Start it with:"; echo "  $RUNNER"
+  bold "Then open:"; echo "  http://localhost:$WEBUI_PORT"
+}
+
+restore_offline_archive() {
+  bold "Restore / install from an e-ai archive"
+
+  local zipf
+  zipf="$(ask_open_zip)" || { warn "Cancelled."; return 1; }
+  info "Using archive: $zipf"
+
+  local work src
+  work="$(mktemp -d /tmp/e-ai-restore.XXXXXX)"
+  info "Extracting (this can take a while for large archives)..."
+  if ! extract_archive "$zipf" "$work"; then
+    bad "Extraction failed."
+    rm -rf "$work"
+    return 1
+  fi
+
+  src="$work/$ARCHIVE_PREFIX"
+  [[ -d "$src" ]] || src="$work"
+
+  install_from_dir "$src" || { rm -rf "$work"; return 1; }
+  rm -rf "$work"
+}
+
+# ----- terminal sessions: web UI + models -----------------------------------
+
+# True when the named thing is currently running.
+webui_running()       { pgrep -f "open-webui" >/dev/null 2>&1; }
+term_model_running()  { pgrep -f "ollama run $1" >/dev/null 2>&1; }
+
+# Small [running]/[stopped] tag for the menu.
+state_tag() { if "$@"; then printf '[running]'; else printf '[stopped]'; fi; }
+
+# Bake the Lodal persona into a derived model named $LODAL_NAME, FROM <base>.
+build_lodal_model() {
+  local base="${1:-$DEFAULT_MODEL}"
+  [[ -s "$PERSONA_FILE" ]] || write_persona_file "$PERSONA_FILE"
+  local mf
+  mf="$(mktemp /tmp/lodal.Modelfile.XXXXXX)"
+  {
+    printf 'FROM %s\n' "$base"
+    printf 'PARAMETER temperature 0.8\n'
+    printf 'SYSTEM """\n'
+    cat "$PERSONA_FILE"
+    printf '\n"""\n'
+  } > "$mf"
+  info "Building '$LODAL_NAME' from $base with the Lodal persona..."
+  if ollama create "$LODAL_NAME" -f "$mf" >>"$LOG_FILE" 2>&1; then
+    rm -f "$mf"; good "'$LODAL_NAME' ready."
+  else
+    rm -f "$mf"; bad "Build failed. Check $LOG_FILE"; return 1
+  fi
+}
+
+# Open a new terminal window that runs <action> (a shell command string).
+# The action runs with our PATH/OLLAMA_MODELS set, and the window stays open
+# after the command exits so errors are visible.
+open_terminal() {
+  local title="$1" action="$2" emu script
+  for emu in gnome-terminal konsole xfce4-terminal mate-terminal tilix kitty alacritty xterm x-terminal-emulator; do
+    have "$emu" && break
+    emu=""
+  done
+  if [[ -z "$emu" ]]; then
+    bad "No terminal emulator found (tried gnome-terminal, konsole, xfce4-terminal, ...)."
+    info "Install one (e.g. sudo apt install gnome-terminal) or run this yourself:"
+    echo "    $action"
+    return 1
+  fi
+
+  # Put the work in a throwaway script to avoid cross-emulator quoting hell.
+  script="$(mktemp "$LOG_DIR/term-XXXXXX")"
+  {
+    echo '#!/usr/bin/env bash'
+    echo "export PATH=\"$BIN_DIR:\$PATH\""
+    echo "[ -d \"$HOME/.ollama/models\" ] && export OLLAMA_MODELS=\"$HOME/.ollama/models\""
+    echo "$action"
+    echo "echo; read -rp 'Press Enter to close...' _"
+    echo "rm -f \"$script\""
+  } > "$script"
+  chmod +x "$script"
+
+  local -a cmd
+  case "$emu" in
+    gnome-terminal) cmd=("$emu" --title="$title" -- bash "$script") ;;
+    konsole)        cmd=("$emu" -p "tabtitle=$title" -e bash "$script") ;;
+    xfce4-terminal) cmd=("$emu" --title="$title" "--command=bash $script") ;;
+    mate-terminal)  cmd=("$emu" --title="$title" "--command=bash $script") ;;
+    tilix)          cmd=("$emu" --title="$title" -e "bash $script") ;;
+    kitty)          cmd=("$emu" --title "$title" bash "$script") ;;
+    alacritty)      cmd=("$emu" -t "$title" -e bash "$script") ;;
+    xterm)          cmd=("$emu" -T "$title" -e bash "$script") ;;
+    *)              cmd=("$emu" -e bash "$script") ;;
+  esac
+
+  nohup "${cmd[@]}" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  good "Opened a new terminal window: $title"
+}
+
+# Option 4: start the web UI in a new window, or stop it in place.
+webui_toggle() {
+  if webui_running; then
+    bold "Stopping Open WebUI..."
+    pkill -f "open-webui" 2>/dev/null || true
+    sleep 1
+    if webui_running; then warn "Open WebUI still appears to be running."; else good "Open WebUI stopped."; fi
+    return 0
+  fi
+  bold "Starting Open WebUI (new terminal window)..."
+  if ! have ollama; then warn "Ollama is not installed yet."; install_ollama; fi
+  if [[ ! -x "$VENV_DIR/bin/open-webui" ]]; then warn "Open WebUI is not installed yet."; install_open_webui; fi
+  create_runner
+  if open_terminal "e-ai Web UI" "bash \"$RUNNER\""; then
+    info "Once it starts, open: http://localhost:$WEBUI_PORT"
+  fi
+}
+
+# List installed model names, one per line (needs the ollama server up).
+list_installed_models() {
+  ollama list 2>/dev/null | awk 'NR>1{print $1}'
+}
+
+# True if any non-Lodal model is being run in a terminal.
+any_generic_model_running() {
+  local lines
+  lines="$(pgrep -af 'ollama run ' 2>/dev/null || true)"
+  grep -v "ollama run $LODAL_NAME\b" <<<"$lines" | grep -q 'ollama run '
+}
+
+# Start a specific model in a new window, or stop it if it's already running.
+toggle_generic_model() {
+  local m="$1"
+  if term_model_running "$m"; then
+    bold "Stopping $m..."
+    pkill -f "ollama run $m" 2>/dev/null || true
+    sleep 1
+    if term_model_running "$m"; then warn "$m still appears to be running."; else good "Stopped $m."; fi
+  else
+    bold "Opening '$m' in a new terminal window..."
+    open_terminal "Model: $m" "ollama run $m"
+  fi
+}
+
+# Build Lodal from a chosen base model and start it in a new window.
+run_lodal_with_base() {
+  local base="$1"
+  build_lodal_model "$base" || return 1
+  bold "Opening Lodal (base: $base) in a new terminal window..."
+  open_terminal "Lodal ($base)" "ollama run $LODAL_NAME"
+}
+
+# Options 8/9: pick which installed model to run in a terminal.
+#   mode "generic" -> run the chosen model as-is (per-model start/stop)
+#   mode "lodal"   -> build Lodal FROM the chosen base, then run it
+menu_run_terminal() {
+  local mode="$1"
+  if ! have ollama; then warn "Ollama is not installed yet."; install_ollama || { pause; return; }; fi
+  start_ollama
+
+  while true; do
+    clear || true
+    if [[ "$mode" == lodal ]]; then
+      bold "Run a model in terminal — Inject Lodal"
+    else
+      bold "Run a model in terminal — Generic"
+    fi
+    echo
+
+    local raw=() models=() m
+    mapfile -t raw < <(list_installed_models)
+    for m in "${raw[@]}"; do
+      # In Lodal mode, don't offer Lodal itself as a base.
+      if [[ "$mode" == lodal && "$m" =~ ^${LODAL_NAME}(:|$) ]]; then continue; fi
+      models+=("$m")
+    done
+
+    if [[ ${#models[@]} -eq 0 ]]; then
+      warn "No models installed yet. Use 'Pull a model' first."
+      pause; return
+    fi
+
+    # In Lodal mode, offer to stop a running Lodal session.
+    if [[ "$mode" == lodal ]] && term_model_running "$LODAL_NAME"; then
+      echo "  s) Stop running Lodal   [running]"
+      echo
+    fi
+
+    local i tag
+    for i in "${!models[@]}"; do
+      tag=""
+      [[ "$mode" == generic ]] && term_model_running "${models[$i]}" && tag="   [running]"
+      printf '  %2d) %s%s\n' "$((i+1))" "${models[$i]}" "$tag"
+    done
+    echo
+    if [[ "$mode" == lodal ]]; then
+      echo "  Pick a base model to build Lodal on.    b) Back"
+    else
+      echo "  Pick a model to start/stop.             b) Back"
+    fi
+    printf 'Choose: '
+    local c; read -r c || return
+    case "${c,,}" in
+      b|back|q) return ;;
+      s)
+        if [[ "$mode" == lodal ]] && term_model_running "$LODAL_NAME"; then
+          bold "Stopping Lodal..."
+          pkill -f "ollama run $LODAL_NAME" 2>/dev/null || true
+          sleep 1
+          if term_model_running "$LODAL_NAME"; then warn "Lodal still running."; else good "Stopped Lodal."; fi
+          pause
+        else
+          warn "Unknown choice."; pause
+        fi
+        ;;
+      *)
+        if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#models[@]} )); then
+          local sel="${models[$((c-1))]}"
+          if [[ "$mode" == lodal ]]; then run_lodal_with_base "$sel"; else toggle_generic_model "$sel"; fi
+          pause
+        else
+          warn "Unknown choice."; pause
+        fi
+        ;;
+    esac
+  done
+}
+
+# ----- menus -----------------------------------------------------------------
+menu_do_everything() {
+  CL_ITEMS=(
+    "Install / repair Ollama"
+    "Pull model: $DEFAULT_MODEL  (text)"
+    "Pull model: $VISION_MODEL  (text + vision/images)"
+    "Install / repair Open WebUI"
+    "Create launcher"
+  )
+  CL_STATE=( 1 1 0 1 1 )
+  checklist_menu "Do everything — choose tasks" || { warn "Cancelled."; return 0; }
+
+  echo
+  bold "Running selected tasks..."
+  if [[ "${CL_STATE[0]:-0}" == 1 ]]; then install_ollama; fi
+  if [[ "${CL_STATE[1]:-0}" == 1 ]]; then pull_model "$DEFAULT_MODEL"; fi
+  if [[ "${CL_STATE[2]:-0}" == 1 ]]; then pull_model "$VISION_MODEL"; fi
+  if [[ "${CL_STATE[3]:-0}" == 1 ]]; then install_open_webui; fi
+  if [[ "${CL_STATE[4]:-0}" == 1 ]]; then create_runner; fi
+
+  echo
+  good "Selected tasks complete."
+  if [[ "${CL_STATE[3]:-0}" == 1 || "${CL_STATE[4]:-0}" == 1 ]]; then
+    echo; bold "Start it with:"; echo "  $RUNNER"
+    echo; bold "Then open:"; echo "  http://localhost:$WEBUI_PORT"
+  fi
+}
+
+menu_install_repair() {
+  while true; do
+    clear || true
+    bold "Install / repair"
+    echo
+    echo "1) Ollama"
+    echo "2) Open WebUI"
+    echo "b) Back"
+    echo
+    printf 'Choose: '
+    local c; read -r c || return
+    case "${c,,}" in
+      1) install_ollama; pause ;;
+      2) install_open_webui; pause ;;
+      b|back|q) return ;;
+      *) warn "Unknown choice."; pause ;;
+    esac
+  done
+}
+
+menu_pull_model() {
+  while true; do
+    clear || true
+    bold "Pull a model"
+    echo
+    echo "1) $DEFAULT_MODEL   (text)"
+    echo "2) $VISION_MODEL   (text + vision / images)"
+    echo "3) Other (type a name)"
+    echo "b) Back"
+    echo
+    printf 'Choose: '
+    local c m; read -r c || return
+    case "${c,,}" in
+      1) pull_model "$DEFAULT_MODEL"; pause ;;
+      2) pull_model "$VISION_MODEL"; pause ;;
+      3)
+        printf 'Model name: '
+        read -r m || true
+        if [[ -n "$m" ]]; then pull_model "$m"; else warn "No name given."; fi
+        pause
+        ;;
+      b|back|q) return ;;
+      *) warn "Unknown choice."; pause ;;
+    esac
+  done
+}
+
+menu_offline() {
+  while true; do
+    clear || true
+    bold "Offline AI Menu"
+    echo
+    echo "1) Create Offline AI Install Archive (.tar.zst/.zip)"
+    echo "2) Restore/install from an e-ai archive"
+    echo "b) Back"
+    echo
+    printf 'Choose: '
+    local c; read -r c || return
+    case "${c,,}" in
+      1) create_offline_archive; pause ;;
+      2) restore_offline_archive; pause ;;
+      b|back|q) return ;;
+      *) warn "Unknown choice."; pause ;;
+    esac
+  done
+}
+
+menu() {
+  while true; do
+    clear || true
+    bold "e-ai: local offline chatbot setup"
+    echo
+    echo "1) Do everything"
+    echo "2) Install/repair"
+    echo "3) Pull a model"
+    echo "4) Start/Stop local web UI                         $(state_tag webui_running)"
+    echo "5) Status"
+    echo "6) Create launcher"
+    echo "7) Offline AI Menu"
+    echo "8) Start/Stop A Model In Terminal (Generic)        $(state_tag any_generic_model_running)"
+    echo "9) Start/Stop A Model In Terminal (Inject Lodal)   $(state_tag term_model_running "$LODAL_NAME")"
+    echo "q) Quit"
+    echo
+    printf 'Choose: '
+    read -r choice || exit 0
+
+    case "${choice,,}" in
+      1) menu_do_everything; pause ;;
+      2) menu_install_repair ;;
+      3) menu_pull_model ;;
+      4) webui_toggle; pause ;;
+      5) status_report; pause ;;
+      6) create_runner; pause ;;
+      7) menu_offline ;;
+      8) menu_run_terminal generic ;;
+      9) menu_run_terminal lodal ;;
+      q|quit|exit) exit 0 ;;
+      *) warn "Unknown choice."; pause ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<USAGE
+$APP_NAME - local AI chatbot setup helper
+
+Usage:
+  ./e-ai.eb              Interactive menu
+  ./e-ai.eb all          Full setup
+  ./e-ai.eb ollama       Install/repair Ollama
+  ./e-ai.eb model [name] Pull model, default: $DEFAULT_MODEL
+  ./e-ai.eb webui        Install/repair Open WebUI
+  ./e-ai.eb start        Start browser web UI
+  ./e-ai.eb status       Show status
+  ./e-ai.eb runner       Create launcher only
+  ./e-ai.eb archive      Create offline install archive (.tar.zst/.zip)
+  ./e-ai.eb restore      Restore/install from an e-ai archive
+
+Environment:
+  WEBUI_PORT=8080              Change Open WebUI port
+  E_LOCAL_AI_DIR=...           Change install data dir
+USAGE
+}
+
+main() {
+  if ! is_linux; then
+    bad "This helper is for Linux."
+    exit 1
+  fi
+
+  case "${1:-}" in
+    "") menu ;;
+    all) do_everything ;;
+    ollama) install_ollama ;;
+    model) pull_model "${2:-$DEFAULT_MODEL}" ;;
+    webui) install_open_webui ;;
+    start) start_webui ;;
+    status) status_report ;;
+    runner) create_runner ;;
+    archive) create_offline_archive ;;
+    restore) restore_offline_archive ;;
+    restore-dir) install_from_dir "${2:?usage: e-ai.eb restore-dir <extracted-archive-dir>}" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
