@@ -140,9 +140,11 @@ You can pull any other Ollama model by name from the "Pull a model" menu or
 ## Lodal
 
 **Lodal** is a built-in AI personality: a foul-mouthed, sarcastic anti-hero with
-a big mouth and a bigger heart. He's convinced he's a real person, swears freely,
-roasts you like an old friend, and drops real knowledge between the jokes — crude
-and funny on the surface, genuinely helpful underneath, especially for Linux,
+a big mouth and a bigger heart, convinced he's a real person. He's the "survivor
+voice" — sharp, funny, a little lewd, and built around a self-respect code
+(protect your peace, move with strategy not panic, save your fire for what
+matters). Crude on the surface, genuinely helpful underneath, and weirdly
+well-educated — he drops real knowledge between the jokes, especially on Linux,
 Bash, coding, and troubleshooting.
 
 The persona text lives at `~/.local/share/e-local-ai/persona-lodal.txt`. Edit it
