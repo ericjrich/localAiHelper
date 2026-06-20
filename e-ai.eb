@@ -20,6 +20,16 @@ LOG_FILE="$LOG_DIR/e-local-ai.log"
 PERSONA_FILE="$BASE_DIR/persona-lodal.txt"   # shared with e-ailodal.eb / restore
 LODAL_NAME="lodal"                           # derived persona model name
 
+# Voice (offline STT/TTS) — always installed, only loaded when you use it.
+VOICE_DIR="$BASE_DIR/voice"
+VOICE_VENV="$BASE_DIR/voice-venv"
+VOICE_CONF="$VOICE_DIR/voice.conf"
+VOICE_HELPER="$VOICE_DIR/voice_chat.py"
+VOICE_PIPER_DIR="$VOICE_DIR/piper"
+VOICE_WHISPER_CACHE="$VOICE_DIR/whisper-cache"
+WHISPER_MODEL_DEFAULT="base"
+PIPER_VOICE_DEFAULT="en_US-lessac-medium"
+
 # Absolute path to this script, used to bundle a copy into offline archives.
 # Empty if the script was piped via stdin (e.g. curl | bash).
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
@@ -105,6 +115,54 @@ pkg_manager() {
   echo unknown
 }
 
+# apt_install <pkgs...> : install packages non-interactively (-y). No prompting.
+apt_install() {
+  [[ $# -gt 0 ]] || return 0
+  local SUDO=""
+  [[ "${EUID:-$(id -u)}" -ne 0 ]] && SUDO="sudo"
+  case "$(pkg_manager)" in
+    apt)
+      $SUDO apt-get update -y >/dev/null 2>&1 || true
+      run_cmd $SUDO apt-get install -y "$@" ;;
+    dnf)    run_cmd $SUDO dnf install -y "$@" ;;
+    pacman) run_cmd $SUDO pacman -S --noconfirm "$@" ;;
+    zypper) run_cmd $SUDO zypper install -y "$@" ;;
+    *) warn "Unknown package manager; please install yourself: $*"; return 1 ;;
+  esac
+}
+
+# ensure_cmd <command> <pkg...> : if <command> is missing, install <pkg...> now.
+ensure_cmd() {
+  local cmd="$1"; shift
+  have "$cmd" && return 0
+  info "'$cmd' not found — installing it now ($*)..."
+  apt_install "$@" || true
+  have "$cmd"
+}
+
+# archive_system_debs <dir> <pkgs...> : download .deb files (for offline install)
+# into <dir>. Best-effort; apt only. The restore step dpkg-installs them.
+archive_system_debs() {
+  local dir="$1"; shift
+  [[ $# -gt 0 ]] || return 0
+  if [[ "$(pkg_manager)" != apt ]]; then
+    info "Non-apt system; skipping system .deb capture."
+    return 0
+  fi
+  mkdir -p "$dir"
+  local abs; abs="$(cd "$dir" && pwd)"
+  local SUDO=""; [[ "${EUID:-$(id -u)}" -ne 0 ]] && SUDO="sudo"
+  info "Capturing system packages for offline install: $*"
+  $SUDO apt-get update -y >/dev/null 2>&1 || true
+  # --reinstall forces a download even for packages already installed here.
+  $SUDO apt-get install -y --reinstall --download-only \
+      -o "Dir::Cache::archives=$abs" -o "Dir::Cache::archives::lock=$abs/lock" \
+      "$@" >/dev/null 2>&1 || warn "Some system packages couldn't be captured (continuing)."
+  $SUDO chown -R "$(id -u):$(id -g)" "$abs" 2>/dev/null || true
+  rm -f "$abs/lock"; rm -rf "$abs/partial" 2>/dev/null || true
+  info "Captured $(ls "$abs"/*.deb 2>/dev/null | wc -l) .deb file(s)."
+}
+
 install_basic_packages() {
   local pm
   pm="$(pkg_manager)"
@@ -112,53 +170,16 @@ install_basic_packages() {
   bold "Checking basic tools"
 
   local missing=()
-
-  if ! have curl; then
-    missing+=("curl")
-  fi
-
-  # xdg-open is nice but not required. Package name is usually xdg-utils.
-  if ! have xdg-open; then
-    missing+=("xdg-utils")
-  fi
+  have curl || missing+=("curl")
+  have xdg-open || missing+=("xdg-utils")
 
   if [[ ${#missing[@]} -eq 0 ]]; then
     good "Basic tools look okay."
     return 0
   fi
 
-  warn "Some basic tools may be missing: ${missing[*]}"
-  info "I will also install ca-certificates when your package manager supports it."
-
-  if ! have sudo && [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    bad "sudo is not available. Install these yourself: ${missing[*]}"
-    return 1
-  fi
-
-  if ! confirm "Install missing basic packages with your package manager?"; then
-    warn "Skipping package install."
-    return 0
-  fi
-
-  case "$pm" in
-    apt)
-      run_cmd sudo apt-get update
-      run_cmd sudo apt-get install -y curl ca-certificates xdg-utils
-      ;;
-    dnf)
-      run_cmd sudo dnf install -y curl ca-certificates xdg-utils
-      ;;
-    pacman)
-      run_cmd sudo pacman -Sy --needed curl ca-certificates xdg-utils
-      ;;
-    zypper)
-      run_cmd sudo zypper install -y curl ca-certificates xdg-utils
-      ;;
-    *)
-      bad "Unknown package manager. Please install: curl ca-certificates xdg-utils"
-      return 1
-      ;;
-  esac
+  warn "Installing missing tools: ${missing[*]} (+ ca-certificates)"
+  apt_install "${missing[@]}" ca-certificates
 }
 
 python_version_ok() {
@@ -441,10 +462,11 @@ status_report() {
 }
 
 do_everything() {
-  bold "Full setup: Ollama + model + Open WebUI + launcher"
+  bold "Full setup: Ollama + model + Open WebUI + voice + launcher"
   install_ollama
   pull_model "$DEFAULT_MODEL"
   install_open_webui
+  install_voice
   create_runner
 
   echo
@@ -955,8 +977,39 @@ create_offline_archive() {
   info "Adding Lodal persona prompt (persona-lodal.txt)."
   write_persona_file "$stage/persona-lodal.txt"
 
+  # 4b) Voice support (if installed): config, helper, Piper voices, Whisper
+  #     cache, plus an offline wheelhouse so the venv rebuilds with no internet.
+  if voice_installed || [[ -d "$VOICE_DIR" ]]; then
+    info "Including voice support (Whisper + Piper) in the archive."
+    mkdir -p "$stage/voice/data" "$stage/voice/wheelhouse"
+    [[ -d "$VOICE_DIR" ]] && cp -a "$VOICE_DIR/." "$stage/voice/data/" 2>/dev/null || true
+    local vpy
+    if [[ -x "$VOICE_VENV/bin/python" ]]; then
+      "$VOICE_VENV/bin/python" -m pip freeze > "$stage/voice/requirements.txt" 2>/dev/null || true
+    fi
+    vpy="$([[ -x "$VOICE_VENV/bin/python" ]] && echo "$VOICE_VENV/bin/python" || find_good_python || true)"
+    if [[ -n "${vpy:-}" ]]; then
+      info "Building voice wheelhouse (downloads from the internet now)..."
+      if [[ -s "$stage/voice/requirements.txt" ]]; then
+        "$vpy" -m pip download --prefer-binary --dest "$stage/voice/wheelhouse" \
+            pip setuptools wheel -r "$stage/voice/requirements.txt" \
+          || warn "Some voice wheels may not have downloaded cleanly."
+      else
+        "$vpy" -m pip download --prefer-binary --dest "$stage/voice/wheelhouse" \
+            pip setuptools wheel faster-whisper piper-tts sounddevice webrtcvad-wheels numpy soundfile requests \
+          || warn "Some voice wheels may not have downloaded cleanly."
+      fi
+    fi
+  fi
+
   # 5) Self-contained installer: bundle a copy of this script + a bootstrap
   #    so a machine WITHOUT e-ai.eb can install straight from the archive.
+  local _pyv
+  _pyv="$(cat "$stage/meta/python-version.txt" 2>/dev/null || echo 3.12)"
+  archive_system_debs "$stage/debs" \
+      ca-certificates curl xdg-utils zstd libportaudio2 alsa-utils \
+      "python${_pyv}-venv" "python${_pyv}-dev" build-essential \
+    || warn "System .deb capture had issues (archive still usable)."
   if [[ -n "${SCRIPT_PATH:-}" && -f "$SCRIPT_PATH" ]]; then
     info "Bundling e-ai.eb and install.sh into the archive."
     cp -f "$SCRIPT_PATH" "$stage/e-ai.eb"
@@ -1117,6 +1170,16 @@ install_from_dir() {
 
   mkdir -p "$BASE_DIR" "$LOG_DIR" "$BIN_DIR"
 
+  # 0) System packages (offline), if the archive captured any.
+  if [[ -d "$src/debs" ]] && ls "$src/debs"/*.deb >/dev/null 2>&1; then
+    info "Installing bundled system packages (offline)..."
+    local SUDO=""; [[ "${EUID:-$(id -u)}" -ne 0 ]] && SUDO="sudo"
+    # Run dpkg twice so inter-package dependency ordering resolves within the set.
+    $SUDO dpkg -i "$src/debs"/*.deb >/dev/null 2>&1 || true
+    $SUDO dpkg -i "$src/debs"/*.deb >/dev/null 2>&1 \
+      || warn "Some bundled system packages may not have installed cleanly."
+  fi
+
   # 1) Ollama binary -> user bin (no sudo needed)
   if [[ -f "$src/ollama/bin/ollama" ]]; then
     info "Installing Ollama binary to $BIN_DIR/ollama"
@@ -1148,6 +1211,35 @@ install_from_dir() {
   local persona_dest="$BASE_DIR/persona-lodal.txt"
   if [[ -f "$src/persona-lodal.txt" ]]; then
     cp -f "$src/persona-lodal.txt" "$persona_dest"
+  fi
+
+  # 4b) Voice support: restore data, then rebuild its venv from the wheelhouse.
+  if [[ -d "$src/voice" ]]; then
+    info "Restoring voice support (Whisper + Piper)..."
+    mkdir -p "$VOICE_DIR"
+    [[ -d "$src/voice/data" ]] && cp -a "$src/voice/data/." "$VOICE_DIR/" 2>/dev/null || true
+    local vwheel="$src/voice/wheelhouse" vpy
+    if [[ -d "$vwheel" && -n "$(ls -A "$vwheel" 2>/dev/null)" ]]; then
+      if vpy="$(find_base_python "$(cat "$src/meta/python-version.txt" 2>/dev/null || echo unknown)")"; then
+        rm -rf "$VOICE_VENV"
+        if "$vpy" -m venv "$VOICE_VENV" 2>/dev/null || \
+           PYTHONPATH="$(ls "$vwheel"/virtualenv-*.whl 2>/dev/null | head -n1)" "$vpy" -m virtualenv --no-download "$VOICE_VENV" 2>/dev/null; then
+          if [[ -s "$src/voice/requirements.txt" ]]; then
+            "$VOICE_VENV/bin/python" -m pip install --no-index --find-links "$vwheel" -r "$src/voice/requirements.txt" \
+              || "$VOICE_VENV/bin/python" -m pip install --no-index --find-links "$vwheel" faster-whisper piper-tts sounddevice webrtcvad-wheels numpy soundfile requests \
+              || warn "Voice venv offline install had problems."
+          else
+            "$VOICE_VENV/bin/python" -m pip install --no-index --find-links "$vwheel" faster-whisper piper-tts sounddevice webrtcvad-wheels numpy soundfile requests \
+              || warn "Voice venv offline install had problems."
+          fi
+          [[ -x "$VOICE_VENV/bin/python" ]] && good "Voice support restored."
+        else
+          warn "Could not create the voice venv on this machine."
+        fi
+      else
+        warn "No compatible Python for the voice venv; voice data restored but not the engine."
+      fi
+    fi
   fi
 
   # 5) Keep the tool: install the bundled e-ai.eb into the user's bin
@@ -1235,8 +1327,13 @@ open_terminal() {
     emu=""
   done
   if [[ -z "$emu" ]]; then
-    bad "No terminal emulator found (tried gnome-terminal, konsole, xfce4-terminal, ...)."
-    info "Install one (e.g. sudo apt install gnome-terminal) or run this yourself:"
+    warn "No terminal emulator found; installing xterm..."
+    apt_install xterm || true
+    have xterm && emu="xterm"
+  fi
+  if [[ -z "$emu" ]]; then
+    bad "No terminal emulator available, and xterm couldn't be installed."
+    info "Run this yourself:"
     echo "    $action"
     return 1
   fi
@@ -1400,15 +1497,601 @@ menu_run_terminal() {
 }
 
 # ----- menus -----------------------------------------------------------------
+# ----- voice support (offline STT/TTS) --------------------------------------
+# Always installed (small next to the LLM weights); only loaded when you use it.
+
+voice_installed() { [[ -x "$VOICE_VENV/bin/python" && -f "$VOICE_HELPER" ]]; }
+
+write_voice_config() {
+  mkdir -p "$VOICE_DIR"
+  [[ -s "$VOICE_CONF" ]] && return 0
+  cat > "$VOICE_CONF" <<EOF
+# e-ai voice settings (offline). Edit, then start voice chat to apply.
+mode=ptt                       # ptt = press Enter to talk | continuous = voice-activated
+whisper_model=$WHISPER_MODEL_DEFAULT          # base, small, medium (bigger = slower, more accurate)
+piper_voice=$PIPER_VOICE_DEFAULT
+persona=lodal                  # lodal | none
+ollama_model=$DEFAULT_MODEL
+ollama_url=$OLLAMA_URL
+input_device=                  # blank = system default mic
+EOF
+  good "Wrote voice config: $VOICE_CONF"
+}
+
+write_voice_helper() {
+  mkdir -p "$VOICE_DIR"
+  cat > "$VOICE_HELPER" <<'PYEOF'
+#!/usr/bin/env python3
+"""e-ai offline voice chat: mic -> faster-whisper -> Ollama -> Piper -> speakers.
+
+Runs inside the e-ai voice venv. Reads defaults from voice.conf; CLI flags win.
+Two modes:
+  ptt        - press Enter to start talking, Enter again to stop
+  continuous - voice-activated (webrtcvad): speak, pause, it replies
+"""
+import argparse
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+SAMPLE_RATE = 16000
+
+
+def log(msg):
+    print(f"[voice] {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg):
+    log(f"ERROR: {msg}")
+    sys.exit(1)
+
+
+def load_config(path):
+    cfg = {}
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.split("#", 1)[0].strip()
+    return cfg
+
+
+def record_ptt(device):
+    import numpy as np
+    import sounddevice as sd
+
+    frames = []
+
+    def cb(indata, n, t, status):
+        frames.append(indata.copy())
+
+    try:
+        input("[voice] Press Enter to START talking... ")
+    except EOFError:
+        return np.zeros(0, dtype="int16")
+    stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                            callback=cb, device=device)
+    with stream:
+        try:
+            input("[voice] Recording... press Enter to STOP. ")
+        except EOFError:
+            pass
+    if not frames:
+        return np.zeros(0, dtype="int16")
+    return np.concatenate(frames, axis=0).flatten()
+
+
+def record_vad(device, aggressiveness=2, silence_ms=800, max_s=30):
+    import collections
+
+    import numpy as np
+    import sounddevice as sd
+    import webrtcvad
+
+    vad = webrtcvad.Vad(int(aggressiveness))
+    frame_ms = 30
+    frame_len = int(SAMPLE_RATE * frame_ms / 1000)
+    ring = collections.deque(maxlen=max(1, int(silence_ms / frame_ms)))
+    voiced = []
+    triggered = False
+    start = time.time()
+
+    log("listening... (speak, then pause)")
+    with sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                           blocksize=frame_len, device=device) as stream:
+        while True:
+            data, _ = stream.read(frame_len)
+            frame = bytes(data)
+            if len(frame) < frame_len * 2:
+                continue
+            try:
+                is_speech = vad.is_speech(frame, SAMPLE_RATE)
+            except Exception:
+                is_speech = False
+            if not triggered:
+                ring.append((frame, is_speech))
+                if sum(1 for _, s in ring if s) > 0.6 * ring.maxlen:
+                    triggered = True
+                    voiced.extend(f for f, _ in ring)
+                    ring.clear()
+                if time.time() - start > max_s * 3:
+                    break  # nothing said for a long while
+            else:
+                voiced.append(frame)
+                ring.append((frame, is_speech))
+                if sum(1 for _, s in ring if not s) > 0.9 * ring.maxlen:
+                    break  # trailing silence -> end of utterance
+                if time.time() - start > max_s:
+                    break
+    if not voiced:
+        return np.zeros(0, dtype="int16")
+    return np.frombuffer(b"".join(voiced), dtype="int16")
+
+
+def transcribe(model, audio):
+    if audio.size == 0:
+        return ""
+    af = audio.astype("float32") / 32768.0
+    segments, _ = model.transcribe(af, vad_filter=False)
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+def ask_ollama(url, model, messages):
+    import requests
+    r = requests.post(f"{url}/api/chat",
+                      json={"model": model, "messages": messages, "stream": False},
+                      timeout=600)
+    r.raise_for_status()
+    return r.json()["message"]["content"]
+
+
+def play_wav(path):
+    for player in (["aplay", "-q", path], ["paplay", path]):
+        if shutil.which(player[0]):
+            subprocess.run(player, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+    try:
+        import soundfile as sf
+        import sounddevice as sd
+        data, sr = sf.read(path, dtype="float32")
+        sd.play(data, sr)
+        sd.wait()
+    except Exception as e:
+        log(f"cannot play audio (install aplay/paplay): {e}")
+
+
+def speak(piper_bin, voice_onnx, text):
+    if not text.strip() or not piper_bin or not os.path.exists(voice_onnx):
+        if not os.path.exists(voice_onnx):
+            log(f"piper voice not found: {voice_onnx}")
+        return
+    wav = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav = tf.name
+        subprocess.run([piper_bin, "-m", voice_onnx, "-f", wav],
+                       input=text.encode("utf-8"), check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        play_wav(wav)
+    except Exception as e:
+        log(f"tts failed: {e}")
+    finally:
+        if wav:
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config")
+    ap.add_argument("--mode")
+    ap.add_argument("--persona", help="path to a persona/system-prompt file, or 'none'")
+    ap.add_argument("--model")
+    ap.add_argument("--whisper-model")
+    ap.add_argument("--piper-voice", help="path to a Piper .onnx voice")
+    ap.add_argument("--ollama-url")
+    ap.add_argument("--device")
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+
+    mode = (args.mode or cfg.get("mode", "ptt")).strip().lower()
+    model = args.model or cfg.get("ollama_model", "llama3.2:3b")
+    url = args.ollama_url or cfg.get("ollama_url", "http://127.0.0.1:11434")
+    whisper_model = args.whisper_model or cfg.get("whisper_model", "base")
+
+    device = args.device if args.device is not None else cfg.get("input_device", "")
+    device = (device or "").strip()
+    if device == "":
+        device = None
+    else:
+        try:
+            device = int(device)
+        except ValueError:
+            pass
+
+    persona_arg = args.persona if args.persona is not None else cfg.get("persona", "none")
+    system_prompt = None
+    if persona_arg and persona_arg.strip().lower() not in ("none", ""):
+        if os.path.exists(persona_arg):
+            system_prompt = open(persona_arg, encoding="utf-8").read().strip()
+        else:
+            log(f"persona file not found ({persona_arg}); continuing without one")
+
+    piper_voice = args.piper_voice or cfg.get("piper_voice_path", "")
+    if not piper_voice:
+        die("no Piper voice given (pass --piper-voice or set piper_voice_path in voice.conf)")
+    piper_bin = shutil.which("piper") or os.path.join(os.path.dirname(sys.executable), "piper")
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        die("faster-whisper isn't installed in this venv")
+
+    log(f"loading Whisper '{whisper_model}' (first run may take a moment)...")
+    wm = WhisperModel(whisper_model, device="cpu", compute_type="int8")
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    quitting = {"v": False}
+
+    def on_int(sig, frm):
+        quitting["v"] = True
+
+    signal.signal(signal.SIGINT, on_int)
+
+    print(f"[voice] ready  model={model}  mode={mode}. Say 'goodbye' or press Ctrl+C to quit.")
+    while not quitting["v"]:
+        try:
+            audio = record_ptt(device) if mode == "ptt" else record_vad(device)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            log(f"audio capture failed: {e}")
+            break
+        if quitting["v"]:
+            break
+        text = transcribe(wm, audio)
+        if not text:
+            log("(didn't catch that)")
+            continue
+        print(f"You: {text}")
+        if text.strip().lower().rstrip(".!").strip() in ("quit", "exit", "goodbye", "stop listening"):
+            break
+        messages.append({"role": "user", "content": text})
+        try:
+            reply = ask_ollama(url, model, messages)
+        except Exception as e:
+            log(f"ollama error: {e}")
+            messages.pop()
+            continue
+        messages.append({"role": "assistant", "content": reply})
+        print(f"{model}: {reply}")
+        speak(piper_bin, piper_voice, reply)
+
+    print("[voice] bye.")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+}
+
+# download_piper_voice <name e.g. en_US-lessac-medium>
+download_piper_voice() {
+  local v="$1"
+  local onnx="$VOICE_PIPER_DIR/$v.onnx" json="$VOICE_PIPER_DIR/$v.onnx.json"
+  mkdir -p "$VOICE_PIPER_DIR"
+  [[ -s "$onnx" && -s "$json" ]] && { info "Piper voice present: $v"; return 0; }
+  local locale="${v%%-*}" rest="${v#*-}"
+  local name="${rest%%-*}" quality="${rest#*-}"
+  local lang="${locale%%_*}"
+  local url="https://huggingface.co/rhasspy/piper-voices/resolve/main/$lang/$locale/$name/$quality"
+  info "Downloading Piper voice: $v"
+  if curl -fsSL "$url/$v.onnx" -o "$onnx" && curl -fsSL "$url/$v.onnx.json" -o "$json"; then
+    good "Piper voice ready: $v"
+  else
+    bad "Failed to download Piper voice '$v'. Check the name or your connection."
+    return 1
+  fi
+}
+
+# The English (en_US) Piper voice set we pre-fetch so every menu choice works
+# offline. Curated to the realistic English voices across quality tiers.
+PIPER_EN_SET=(
+  en_US-amy-low en_US-amy-medium
+  en_US-ryan-low en_US-ryan-medium en_US-ryan-high
+  en_US-lessac-low en_US-lessac-medium en_US-lessac-high
+  en_US-kusal-medium
+  en_US-joe-medium
+  en_US-kathleen-low
+  en_US-hfc_female-medium
+  en_US-hfc_male-medium
+  en_US-libritts-high
+  en_US-libritts_r-medium
+  en_US-danny-low
+  en_US-arctic-medium
+  en_US-l2arctic-medium
+  en_US-bryce-medium
+  en_US-john-medium
+  en_US-norman-medium
+  en_GB-alan-low en_GB-alan-medium
+  en_GB-alba-medium
+  en_GB-aru-medium
+  en_GB-cori-high en_GB-cori-medium
+  en_GB-jenny_dioco-medium
+  en_GB-northern_english_male-medium
+  en_GB-semaine-medium
+  en_GB-southern_english_female-low
+  en_GB-vctk-medium
+)
+
+# Download the whole English voice set (best-effort; skips any that 404).
+download_piper_english_set() {
+  bold "Downloading the English Piper voice set (${#PIPER_EN_SET[@]} voices)..."
+  local v ok=0 fail=0
+  for v in "${PIPER_EN_SET[@]}"; do
+    if download_piper_voice "$v" >/dev/null 2>&1; then
+      ok=$((ok+1))
+    else
+      fail=$((fail+1))
+      warn "  skipped $v (not available)"
+    fi
+  done
+  good "English voice set: $ok downloaded, $fail skipped."
+}
+
+install_voice() {
+  bold "Setting up offline voice support (faster-whisper + Piper)"
+
+  info "Installing audio system packages (libportaudio2, alsa-utils)..."
+  apt_install libportaudio2 alsa-utils \
+    || warn "Could not install libportaudio2/alsa-utils; mic/playback may not work until you do."
+
+  local py
+  py="$(find_good_python || true)"
+  [[ -n "$py" ]] || { bad "Need Python 3.11/3.12 for voice support."; return 1; }
+
+  if [[ ! -x "$VOICE_VENV/bin/python" ]]; then
+    info "Creating voice virtual environment..."
+    "$py" -m venv "$VOICE_VENV" || { bad "Could not create the voice venv (is python3-venv installed?)."; return 1; }
+  fi
+
+  info "Installing voice packages (faster-whisper, piper-tts, sounddevice, webrtcvad)..."
+  "$VOICE_VENV/bin/python" -m pip install --upgrade pip >/dev/null 2>&1 || true
+  if ! "$VOICE_VENV/bin/python" -m pip install faster-whisper piper-tts sounddevice webrtcvad-wheels numpy soundfile requests; then
+    bad "Voice package install failed."
+    return 1
+  fi
+
+  mkdir -p "$VOICE_PIPER_DIR" "$VOICE_WHISPER_CACHE"
+  write_voice_config
+  write_voice_helper
+
+  info "Pre-downloading Whisper models (base + small)..."
+  HF_HOME="$VOICE_WHISPER_CACHE" "$VOICE_VENV/bin/python" - <<PY || warn "Whisper predownload failed (it'll fetch on first use)."
+from faster_whisper import WhisperModel
+for m in ("base", "small"):
+    WhisperModel(m, device="cpu", compute_type="int8")
+print("ok")
+PY
+
+  download_piper_english_set || warn "Some Piper voices didn't download; you can grab them later."
+
+  good "Voice support installed. Use 'Voice chat' from the menu (or ./e-ai.eb voice)."
+}
+
+# Run the offline voice loop.
+voice_chat() {
+  bold "Voice chat (offline: speak -> local model -> spoken reply)"
+
+  if ! voice_installed; then
+    warn "Voice support isn't installed yet."
+    if confirm "Install it now?"; then install_voice || return 1; else return 1; fi
+  fi
+  write_voice_config
+  [[ -f "$VOICE_HELPER" ]] || write_voice_helper
+
+  if ! have ollama; then warn "Ollama is not installed yet."; install_ollama || return 1; fi
+  start_ollama
+
+  # Defaults come from voice.conf; the prompts below override per session.
+  local cfg_voice cfg_model
+  cfg_voice="$(awk -F= '/^piper_voice=/{v=$2; sub(/#.*/,"",v); gsub(/[[:space:]]/,"",v); print v; exit}' "$VOICE_CONF" 2>/dev/null || true)"
+  cfg_model="$(awk -F= '/^ollama_model=/{v=$2; sub(/#.*/,"",v); gsub(/[[:space:]]/,"",v); print v; exit}' "$VOICE_CONF" 2>/dev/null || true)"
+  cfg_voice="${cfg_voice:-$PIPER_VOICE_DEFAULT}"
+  cfg_model="${cfg_model:-$DEFAULT_MODEL}"
+
+  # --- 1) Model (from installed models) ---
+  local models=() model="$cfg_model" i mc
+  mapfile -t models < <(list_installed_models)
+  echo
+  bold "Which model?"
+  if [[ ${#models[@]} -gt 0 ]]; then
+    for i in "${!models[@]}"; do printf '  %2d) %s\n' "$((i+1))" "${models[$i]}"; done
+    printf 'Model number, or a name [Enter = %s]: ' "$cfg_model"
+    read -r mc || true
+    if [[ -n "$mc" ]]; then
+      if [[ "$mc" =~ ^[0-9]+$ ]] && (( mc >= 1 && mc <= ${#models[@]} )); then
+        model="${models[$((mc-1))]}"
+      else
+        model="$mc"
+      fi
+    fi
+  else
+    warn "No installed models found; using $cfg_model (it'll pull if needed)."
+  fi
+
+  # --- 2) Personality ---
+  echo
+  bold "Personality?"
+  echo "  1) Lodal (inject the Lodal persona)"
+  echo "  2) Custom prompt (type your own, or a path to a .txt)"
+  echo "  3) Generic (no system prompt)"
+  printf 'Choose [1]: '
+  local pc; read -r pc || true
+  local persona_arg="none"
+  case "$pc" in
+    2)
+      printf 'Your system prompt (one line) or a path to a .txt file:\n> '
+      local custom; read -r custom || true
+      if [[ -n "$custom" && -f "$custom" ]]; then
+        persona_arg="$custom"
+      elif [[ -n "$custom" ]]; then
+        printf '%s\n' "$custom" > "$VOICE_DIR/custom-prompt.txt"
+        persona_arg="$VOICE_DIR/custom-prompt.txt"
+      fi
+      ;;
+    3) persona_arg="none" ;;
+    *)
+      [[ -s "$PERSONA_FILE" ]] || write_persona_file "$PERSONA_FILE"
+      persona_arg="$PERSONA_FILE"
+      ;;
+  esac
+
+  # --- 3) Voice ---
+  echo
+  bold "Voice?"
+  echo "  1) Female  (en_US-amy-medium)"
+  echo "  2) Male    (en_US-ryan-medium)"
+  echo "  3) Neutral (en_US-lessac-medium)"
+  echo "  4) Other   (type a Piper voice name)"
+  printf 'Choose [Enter = %s]: ' "$cfg_voice"
+  local vc voice="$cfg_voice"; read -r vc || true
+  case "$vc" in
+    1) voice="en_US-amy-medium" ;;
+    2) voice="en_US-ryan-medium" ;;
+    3) voice="en_US-lessac-medium" ;;
+    4) printf 'Piper voice name: '; local vn; read -r vn || true; [[ -n "$vn" ]] && voice="$vn" ;;
+    "") voice="$cfg_voice" ;;
+    *) voice="$vc" ;;
+  esac
+
+  local voice_onnx="$VOICE_PIPER_DIR/$voice.onnx"
+  if [[ ! -f "$voice_onnx" ]]; then
+    info "Voice '$voice' not present; downloading..."
+    download_piper_voice "$voice" || { bad "Couldn't get voice '$voice'."; return 1; }
+  fi
+
+  # --- 4) Mode ---
+  echo
+  bold "Mode?"
+  echo "  1) Push-to-talk (press Enter to start/stop)"
+  echo "  2) Continuous (voice-activated)"
+  printf 'Mode [1]: '
+  local mc2 mode="ptt"; read -r mc2 || true
+  [[ "$mc2" == 2 ]] && mode="continuous"
+
+  echo
+  bold "Starting voice chat  (model=$model  voice=$voice  mode=$mode)."
+
+  # Build the exact command, safely quoted, and run it in a new terminal window.
+  local action
+  printf -v action 'HF_HOME=%q %q %q --config %q --mode %q --persona %q --model %q --piper-voice %q' \
+    "$VOICE_WHISPER_CACHE" "$VOICE_VENV/bin/python" "$VOICE_HELPER" \
+    "$VOICE_CONF" "$mode" "$persona_arg" "$model" "$voice_onnx"
+
+  if ! open_terminal "Voice chat ($model)" "$action"; then
+    warn "Couldn't open a new terminal; running here instead. Say 'goodbye' or press Ctrl+C to stop."
+    HF_HOME="$VOICE_WHISPER_CACHE" "$VOICE_VENV/bin/python" "$VOICE_HELPER" \
+      --config "$VOICE_CONF" \
+      --mode "$mode" \
+      --persona "$persona_arg" \
+      --model "$model" \
+      --piper-voice "$voice_onnx" || warn "Voice chat exited with an error."
+  fi
+}
+
+uninstall_all() {
+  bold "Uninstall / start over"
+  echo
+  warn "This removes what e-ai set up. You choose how far it goes."
+  echo
+  echo "  Always removed (after you confirm):"
+  echo "    - Open WebUI venv, voice venv, voice data, persona, logs"
+  echo "        $BASE_DIR"
+  echo "    - Launcher: $RUNNER"
+  echo
+  echo "  Asked separately:"
+  echo "    - Downloaded Ollama models (multi-GB; keep them to avoid re-pulling)"
+  echo "    - Ollama itself (binary + service)"
+  echo
+  if ! confirm "Proceed with uninstall?"; then warn "Cancelled. Nothing was removed."; return 0; fi
+
+  local remove_models="no" remove_ollama="no"
+  if have ollama; then
+    confirm "Also delete downloaded Ollama models?" && remove_models="yes"
+    if confirm "Also UNINSTALL Ollama entirely (binary + service + all models)?"; then
+      remove_ollama="yes"; remove_models="yes"
+    fi
+  fi
+
+  # Models-only (keeping Ollama): remove them cleanly while the server is up.
+  if [[ "$remove_models" == "yes" && "$remove_ollama" == "no" ]] && have ollama; then
+    info "Removing Ollama models..."
+    start_ollama >/dev/null 2>&1 || true
+    local m
+    while read -r m; do
+      [[ -n "$m" ]] && { ollama rm "$m" >/dev/null 2>&1 && info "  removed $m" || true; }
+    done < <(list_installed_models 2>/dev/null || true)
+  fi
+
+  # Stop anything we may have started.
+  info "Stopping services..."
+  pkill -f "open-webui" 2>/dev/null || true
+  pkill -f "ollama serve" 2>/dev/null || true
+
+  # Remove e-ai's data directory and launcher.
+  if [[ -d "$BASE_DIR" ]]; then
+    info "Removing data directory: $BASE_DIR"
+    rm -rf "$BASE_DIR"
+  fi
+  if [[ -f "$RUNNER" ]]; then
+    info "Removing launcher: $RUNNER"
+    rm -f "$RUNNER"
+  fi
+
+  # Full Ollama removal (documented uninstall steps; best-effort).
+  if [[ "$remove_ollama" == "yes" ]]; then
+    info "Uninstalling Ollama..."
+    local SUDO=""; [[ "${EUID:-$(id -u)}" -ne 0 ]] && SUDO="sudo"
+    $SUDO systemctl stop ollama 2>/dev/null || true
+    $SUDO systemctl disable ollama 2>/dev/null || true
+    $SUDO rm -f /etc/systemd/system/ollama.service 2>/dev/null || true
+    $SUDO systemctl daemon-reload 2>/dev/null || true
+    local ob; ob="$(command -v ollama 2>/dev/null || true)"
+    [[ -n "$ob" ]] && $SUDO rm -f "$ob" 2>/dev/null || true
+    $SUDO rm -rf /usr/share/ollama 2>/dev/null || true
+    rm -rf "$HOME/.ollama" 2>/dev/null || true
+    $SUDO userdel ollama 2>/dev/null || true
+    $SUDO groupdel ollama 2>/dev/null || true
+    good "Ollama removed."
+  fi
+
+  echo
+  good "Uninstall complete."
+  info "To set up fresh, run 'Do everything' from the menu (or ./e-ai.eb all)."
+}
+
 menu_do_everything() {
   CL_ITEMS=(
     "Install / repair Ollama"
     "Pull model: $DEFAULT_MODEL  (text)"
     "Pull model: $VISION_MODEL  (text + vision/images)"
     "Install / repair Open WebUI"
+    "Set up voice support (Whisper + Piper)"
     "Create launcher"
   )
-  CL_STATE=( 1 1 0 1 1 )
+  CL_STATE=( 1 1 0 1 1 1 )
   checklist_menu "Do everything — choose tasks" || { warn "Cancelled."; return 0; }
 
   echo
@@ -1417,11 +2100,12 @@ menu_do_everything() {
   if [[ "${CL_STATE[1]:-0}" == 1 ]]; then pull_model "$DEFAULT_MODEL"; fi
   if [[ "${CL_STATE[2]:-0}" == 1 ]]; then pull_model "$VISION_MODEL"; fi
   if [[ "${CL_STATE[3]:-0}" == 1 ]]; then install_open_webui; fi
-  if [[ "${CL_STATE[4]:-0}" == 1 ]]; then create_runner; fi
+  if [[ "${CL_STATE[4]:-0}" == 1 ]]; then install_voice; fi
+  if [[ "${CL_STATE[5]:-0}" == 1 ]]; then create_runner; fi
 
   echo
   good "Selected tasks complete."
-  if [[ "${CL_STATE[3]:-0}" == 1 || "${CL_STATE[4]:-0}" == 1 ]]; then
+  if [[ "${CL_STATE[3]:-0}" == 1 || "${CL_STATE[5]:-0}" == 1 ]]; then
     echo; bold "Start it with:"; echo "  $RUNNER"
     echo; bold "Then open:"; echo "  http://localhost:$WEBUI_PORT"
   fi
@@ -1508,6 +2192,8 @@ menu() {
     echo "7) Offline AI Menu"
     echo "8) Start/Stop A Model In Terminal (Generic)        $(state_tag any_generic_model_running)"
     echo "9) Start/Stop A Model In Terminal (Inject Lodal)   $(state_tag term_model_running "$LODAL_NAME")"
+    echo "v) Voice chat (offline)"
+    echo "u) Uninstall / start over"
     echo "q) Quit"
     echo
     printf 'Choose: '
@@ -1523,6 +2209,8 @@ menu() {
       7) menu_offline ;;
       8) menu_run_terminal generic ;;
       9) menu_run_terminal lodal ;;
+      v) voice_chat; pause ;;
+      u) uninstall_all; pause ;;
       q|quit|exit) exit 0 ;;
       *) warn "Unknown choice."; pause ;;
     esac
@@ -1542,6 +2230,8 @@ Usage:
   ./e-ai.eb start        Start browser web UI
   ./e-ai.eb status       Show status
   ./e-ai.eb runner       Create launcher only
+  ./e-ai.eb voice        Offline voice chat (mic -> model -> speakers)
+  ./e-ai.eb uninstall    Remove e-ai (optionally Ollama + models) to start over
   ./e-ai.eb archive      Create offline install archive (.tar.zst/.zip)
   ./e-ai.eb restore      Restore/install from an e-ai archive
 
@@ -1568,6 +2258,8 @@ main() {
     runner) create_runner ;;
     archive) create_offline_archive ;;
     restore) restore_offline_archive ;;
+    voice|voice-chat) voice_chat ;;
+    uninstall) uninstall_all ;;
     restore-dir) install_from_dir "${2:?usage: e-ai.eb restore-dir <extracted-archive-dir>}" ;;
     -h|--help|help) usage ;;
     *) usage; exit 1 ;;
