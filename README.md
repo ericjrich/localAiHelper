@@ -78,9 +78,9 @@ u) Uninstall / start over
 q) Quit
 ```
 
-- **1) Do everything** — a checklist: tick which tasks to run (install Ollama, pull `llama3.2:3b`, pull `gemma3:4b`, install Open WebUI, set up voice support, create launcher), then go.
+- **1) Do everything** — a checklist: tick which tasks to run (install Ollama, pull `llama3.2:3b`, pull `gemma3:4b`, pull `dolphin3`, pull `dolphin-mistral`, install Open WebUI, set up voice support, create launcher), then go.
 - **2) Install/repair** — submenu for Ollama or Open WebUI individually.
-- **3) Pull a model** — pick `llama3.2:3b`, `gemma3:4b`, or type any model name.
+- **3) Pull a model** — pick `llama3.2:3b`, `gemma3:4b`, `dolphin3`, `dolphin-mistral`, or type any model name.
 - **4) Start/Stop local web UI** — starts Open WebUI in a **new terminal window** (so the menu stays usable); stops it in place when running.
 - **5) Status** — what's installed and running.
 - **6) Create launcher** — writes a standalone start script.
@@ -114,6 +114,8 @@ q) Quit
 | --- | --- | --- |
 | `llama3.2:3b` | Text chat | Small and fast; the default. |
 | `gemma3:4b` | Text **+ images** | Multimodal — paste an image path into your prompt to have it look at screenshots, photos, diagrams, etc. Needs Ollama 0.6+. |
+| `dolphin3` | Text chat | Dolphin 3.0 (Llama 3.1 8B, ~4.9 GB). Uncensored / steerable general-purpose model — you set the alignment via the system prompt. Pairs well with Lodal. |
+| `dolphin-mistral` | Text chat | Dolphin on Mistral 0.2 (7B, ~4.1 GB, 32K context). Uncensored, Apache-2.0, strong at coding. |
 
 You can pull any other Ollama model by name from the "Pull a model" menu or
 `./e-ai.eb model <name>`.
